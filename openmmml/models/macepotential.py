@@ -130,6 +130,7 @@ class MACEPotentialImpl(MLPotentialImpl):
         system: openmm.System,
         atoms: Optional[Iterable[int]],
         forceGroup: int,
+        linkBonds: Iterable[list[int, int]], 
         precision: Optional[str] = None,
         returnEnergyType: str = "interaction_energy",
         **args,
@@ -197,6 +198,10 @@ class MACEPotentialImpl(MLPotentialImpl):
             includedAtoms = [includedAtoms[i] for i in atoms]
         atomicNumbers = [atom.element.atomic_number for atom in includedAtoms]
 
+        # Add an H atom for each link atom needed:
+        atomicNumbers += [1] * len(linkBonds)
+
+        print(atomicNumbers)
         # Set the precision that the model will be used with.
 
         modelDefaultDtype = next(model.parameters()).dtype
@@ -237,7 +242,9 @@ class MACEPotentialImpl(MLPotentialImpl):
                           charge=torch.tensor([float(args.get('charge', 0))], dtype=dtype, device=device, requires_grad=False),
                           multiplicity=torch.tensor([float(args.get('multiplicity', 1))], dtype=dtype, device=device, requires_grad=False),
                           indices=indices,
-                          periodic=periodic)
+                          periodic=periodic,
+                          linkbonds=linkBonds if len(linkBonds) > 0 else None)
+        
         force = openmm.PythonForce(compute)
         force.setForceGroup(forceGroup)
         force.setUsesPeriodicBoundaryConditions(periodic)
@@ -250,7 +257,7 @@ class MACEPotentialImpl(MLPotentialImpl):
         return None
 
 
-def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, charge, multiplicity, indices, periodic):
+def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, charge, multiplicity, indices, periodic, linkbonds):
     import torch
     from mace.data.neighborhood import get_neighborhood
     energyScale = 96.4853
@@ -258,7 +265,20 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
     positions = state.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
     numAtoms = positions.shape[0]
     if indices is not None:
-        positions = positions[indices]
+        _positions = positions[indices]
+        if linkbonds is not None:
+            positions_wla = np.empty([len(indices) + len(linkbonds), 3])
+            positions_wla[:len(indices)] = _positions
+            for ilb, lb in enumerate(linkbonds):
+                cqm = positions[lb[0]]
+                cmm = positions[lb[1]]
+                vers = cmm-cqm
+                vers /= np.linalg.norm(vers)
+
+                positions_wla[len(indices) + ilb] = cqm + vers * 1.0 # TODO here the correct distance should be used.
+            _positions = positions_wla
+
+        positions = _positions
     if periodic:
         cell = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.angstrom)
     else:
@@ -288,6 +308,32 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
     forces = (results["forces"]*energyScale*lengthScale).detach().cpu().numpy()
     if indices is not None:
         f = np.zeros((numAtoms, 3), dtype=(np.float64 if dtype == torch.float64 else np.float32))
-        f[indices] = forces
+        f[indices] = forces[:len(indices)]
+        if linkbonds is not None:
+            full_positions = state.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
+            for ilb, lb in enumerate(linkbonds):
+                iqm = lb[0]
+                imm = lb[1]
+                project_link_atom_force(f, 
+                                        full_positions, 
+                                        forces[len(indices)+ilb], 
+                                        iqm, imm)
         forces = f
+
+    print(np.sum(forces, axis=0))
+
     return energy, forces
+
+def project_link_atom_force(out_forces, positions, la_force, iqm, imm):
+    delta = positions[imm] - positions[iqm]
+    na = np.linalg.norm(delta)
+    delta = np.reshape(delta, [3,1])
+
+    dedmm = - delta @ delta.T + np.eye(3) * na * na
+    dedmm *= 1.0 / (na**3) # TODO LA DISTANCE SHOULD BE IMPLEMENTED SOMEHOW
+
+    dedqm = np.eye(3) - dedmm
+
+    out_forces[imm] += dedmm @ la_force
+    out_forces[iqm] += dedqm @ la_force
+
