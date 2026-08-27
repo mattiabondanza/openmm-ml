@@ -383,17 +383,17 @@ boundary between the ML and MM regions.  If a molecule in the `Topology` provide
 then the molecule will appear as is to the MM force field, but will have these bonds capped by hydrogen atoms when its
 fragment(s) within the ML region are evaluated by the ML potential.
 
-The fictitious link atoms added are implemented as virtual sites which will be inserted into the `System` and `Topology`
-in use.  By default, `createMixedSystem()` only returns the `System`, but passing `returnInfo=True` returns a dictionary
-instead, with keys `system` (the `System`), `topology` (a modified copy of the `Topology` with the added sites), and
-`oldToNew` (a list of atom indices serving as a mapping from those in the original `Topology` to those in the modified
-one).  Since they are non-physical sites added only for implementing the method, the link atoms will be added to their
-own chain in the `Topology` separate from any existing chains.
+The fictitious link atoms are not real particles: they are not added to the `System` or the `Topology`, so the
+`System` returned by `createMixedSystem()` has the same number of particles as the input one, the `Topology` is not
+modified, and the link atoms do not need to be taken into account when manipulating the system from a calling script.
+Instead, whenever the ML potential is evaluated, the position of each link atom is computed on the fly along the
+respective bond crossing the boundary, and the force the ML potential exerts on the link atom is projected onto the
+two atoms of that bond.
 
-Each link atom is maintained at a fixed distance along its respective bond crossing the boundary.  By default, this
-distance is chosen based on the covalent radius of the atom on the ML side of the bond.  To override these distances,
-pass `linkAtomDistances=[...]` to `createMixedSystem()` with a list of tuples `(atom1, atom2, distance)` for each pair
-of atoms for which to use a custom distance.
+Each link atom is a hydrogen, maintained at a fixed distance from the atom on the ML side of its bond.  By default,
+this distance is chosen as the sum of the covalent radii of the ML-side atom and the link atom.  To override these
+distances, pass `linkAtomPrm=[...]` to `createMixedSystem()` with a list of tuples `(atom1, atom2, distance)` for
+each pair of atoms for which to use a custom distance.
 
 To avoid double-counting bonded interactions between the MM force field and ML potential, OpenMM-ML will delete:
 - All MM bonds contained completely within the ML region.

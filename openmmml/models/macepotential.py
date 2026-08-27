@@ -148,6 +148,14 @@ class MACEPotentialImpl(MLPotentialImpl):
             The indices of the atoms to include in the model. If ``None``, all atoms are included.
         forceGroup : int
             The force group to which the force should be assigned.
+        linkBondsData : list of dict, optional
+            Link atom data for bonds spanning the ML and MM regions of a mixed
+            system, in the format used by the mechanical embedding (see
+            ``openmmml.embeddings.utilities``).  For each entry, a link atom is
+            added to the set of atoms evaluated by the model, placed at the
+            specified distance from the atom on the ML side of the bond, and
+            the force on the link atom is projected back onto the two atoms of
+            the bond.
         precision : str, optional
             The precision of the model. Supported options are 'single' and 'double'.
             If ``None``, the default precision of the model is used.

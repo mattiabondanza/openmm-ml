@@ -143,7 +143,7 @@ class MechanicalEmbedding(Embedding):
                             linkBondsData[-1]['d'] = lap[2]
 
                 if 'd' not in linkBondsData[-1]:
-                    # Use VdW table if provided
+                    # Use the default distance from the covalent radii table
                     linkBondsData[-1]['d'] = utilities.get_linkatom_distance(topology,
                                                                              linkBondsData[-1]['ml'],
                                                                              linkBondsData[-1]['mm'],
@@ -195,17 +195,13 @@ class MechanicalEmbedding(Embedding):
 
         newTopology = copy.deepcopy(topology)
         if interpolate:
-            # For interpolation setup to work, we need to modify the original
-            # system so that its NonbondedForce also has the virtual site.
+            # Work on a copy of the original system so that the caller's
+            # System is not modified by the interpolation setup.
             system = copy.deepcopy(system)
-            systemList = [system, newSystem]
-        else:
-            systemList = [newSystem]
-        #capIndices, oldToNew = utilities.addLinkAtomSites(newTopology, systemList, linkBonds, args.get("linkAtomDistances", []))
 
         if interpolate:
             interpolator = utilities.InterpolationHelper()
-            interpolator.addMLPotentialTerms(potential, newTopology, atoms, forceGroup, **args)
+            interpolator.addMLPotentialTerms(potential, newTopology, atoms, forceGroup, linkBondsData=linkBondsData, **args)
             interpolator.addMMBondedTerms(system, atoms, linkBondsData)
             interpolator.setupNonbonded(newSystem, system)
             if excludeLongRange:
@@ -223,6 +219,8 @@ class MechanicalEmbedding(Embedding):
             potential.addForces(newTopology, newSystem, atoms, forceGroup, linkBondsData, **args)
 
         if returnInfo:
-            return dict(system=newSystem, topology=newTopology)
+            # The link-atom method does not modify the Topology, so the atom
+            # mapping is the identity.
+            return dict(system=newSystem, topology=newTopology, oldToNew=list(range(newTopology.getNumAtoms())))
         else:
             return newSystem

@@ -94,7 +94,7 @@ class MLPotentialImpl(object):
                   system: openmm.System,
                   atoms: Iterable[int] | None,
                   forceGroup: int,
-                  linkBondsData: list[dict], 
+                  linkBondsData: list[dict] | None = None,
                   **args):
         """Add Force objects to a System to implement the potential function.
 
@@ -112,6 +112,12 @@ class MLPotentialImpl(object):
             it should be applied to the entire System
         forceGroup: int
             the force group that any newly added Forces should be in
+        linkBondsData: list[dict], optional
+            link atom data for bonds spanning the ML and MM regions of a mixed
+            system, in the format used by the mechanical embedding's link-atom
+            method (see `openmmml.embeddings.utilities`).  Only potentials that
+            support the link-atom method need to handle this argument; others
+            may ignore it.
         args:
             any additional keyword arguments that were provided to createSystem()
             are passed to this method.  This allows subclasses to customize their
@@ -381,7 +387,9 @@ class MLPotential(object):
             particular potential functions or embedding methods may define
             additional arguments that can be used to customize them.  See the
             documentation on the specific potential functions and embedding
-            methods for more information.
+            methods for more information.  For example, the mechanical
+            embedding accepts a `linkAtomPrm` option to override the distances
+            of the link atoms used for bonds spanning the ML and MM regions.
 
         Returns
         -------

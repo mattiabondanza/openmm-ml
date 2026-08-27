@@ -88,11 +88,68 @@ def findLinkBonds(topology: openmm.app.Topology, atoms: list[int]) -> list[tuple
     return linkBonds
 
 def get_linkatom_distance(topology: openmm.app.Topology, mlAtom: int, mmAtom: int, laZ: int) -> unit.Quantity:
-    key = min(mlAtom, mmAtom), max(mlAtom, mmAtom)
+    """
+    Computes the default distance between the atom on the ML side of a link
+    bond and its link atom, as the sum of the covalent radii of the ML-side
+    atom and the link atom.
+
+    Parameters
+    ----------
+    topology: Topology
+        The Topology to look up atomic numbers from.
+    mlAtom: int
+        The index of the atom on the ML side of the link bond.  This is the
+        atom the link atom is placed at a fixed distance from, so only its
+        covalent radius is used.
+    mmAtom: int
+        The index of the atom on the MM side of the link bond.
+    laZ: int
+        The atomic number of the link atom.
+
+    Returns
+    -------
+    The default link atom distance, in picometers.
+    """
+
     atomicNumbers = [atom.element.atomic_number for atom in topology.atoms()]
     return COVALENT_RADII[atomicNumbers[mlAtom]] + COVALENT_RADII[laZ]
 
-def ml_forces_to_system(positions, ml_forces, indices, linkBondsData):
+def ml_forces_to_system(positions: np.ndarray, ml_forces: np.ndarray, indices: list[int] | None, linkBondsData: list[dict] | None) -> np.ndarray:
+    """
+    Distributes the forces computed by an ML potential over the atoms of the
+    full system.
+
+    The forces on the atoms in the ML subset are placed at their respective
+    indices, and the force on each link atom is projected onto the two atoms
+    of the bond spanning the ML and MM regions.  Since the position of a link
+    atom is a function only of the positions of those two atoms (it lies at a
+    fixed distance from the ML-side atom, along the bond), this projection is
+    the exact gradient of the link atom's contribution to the energy with
+    respect to the positions of the two atoms, and the total force on the
+    system remains the exact negative gradient of the total energy.
+
+    Parameters
+    ----------
+    positions: ndarray
+        The positions of all atoms in the system, as a (numAtoms, 3) array.
+        Only used to determine the output shape and the direction of each
+        link bond.
+    ml_forces: ndarray
+        The forces computed by the ML potential, in the order produced by
+        `system_positions_to_ml()` (the ML subset atoms first, followed by the
+        link atoms), as a ((numMLAtoms + numLinkAtoms), 3) array.
+    indices: list[int] or None
+        The indices of the ML subset atoms in the system, or None if all atoms
+        are in the ML subset.
+    linkBondsData: list[dict] or None
+        The link atom data, in the format used by `removeBonds()`, or None if
+        there are no link atoms.
+
+    Returns
+    -------
+    The forces on all atoms in the system, as a (numAtoms, 3) array.
+    """
+
     if indices is None:
         # Everything is ML, nothing to do
         return ml_forces
@@ -119,7 +176,33 @@ def ml_forces_to_system(positions, ml_forces, indices, linkBondsData):
             out_forces[iqm] += dedqm @ ml_forces[nml + i]
     return out_forces
 
-def system_positions_to_ml(positions, indices, linkBondsData):
+def system_positions_to_ml(positions: np.ndarray, indices: list[int] | None, linkBondsData: list[dict] | None) -> np.ndarray:
+    """
+    Computes the positions of the atoms evaluated by an ML potential from the
+    positions of the full system.
+
+    The positions of the atoms in the ML subset are selected, followed by the
+    positions of the link atoms.  Each link atom lies at a fixed distance
+    (specified in its `linkBondsData` entry) from the atom on the ML side of
+    its link bond, in the direction of the atom on the MM side.
+
+    Parameters
+    ----------
+    positions: ndarray
+        The positions of all atoms in the system, as a (numAtoms, 3) array.
+    indices: list[int] or None
+        The indices of the ML subset atoms in the system, or None if all atoms
+        are in the ML subset.
+    linkBondsData: list[dict] or None
+        The link atom data, in the format used by `removeBonds()`, or None if
+        there are no link atoms.
+
+    Returns
+    -------
+    The positions of the ML subset atoms followed by the link atoms, as a
+    ((numMLAtoms + numLinkAtoms), 3) array.
+    """
+
     if indices is None:
         return positions
 
@@ -146,9 +229,10 @@ def removeBonds(system: openmm.System, atoms: list[int], removeInSet: bool, link
     Copy a System, removing all bonded interactions between atoms in (or not in)
     a particular set.
 
-    If `linkBonds` is specified, an expanded set of atoms including those bonded
-    to atoms in the set by bonds in `linkBonds` will be used for the angles and
-    torsions.  This behavior is appropriate for use with the link-atom method.
+    If `linkBondsData` is specified, an expanded set of atoms including those
+    bonded to atoms in the set by the link bonds will be used for the angles
+    and torsions.  This behavior is appropriate for use with the link-atom
+    method.
 
     Parameters
     ----------
@@ -160,11 +244,12 @@ def removeBonds(system: openmm.System, atoms: list[int], removeInSet: bool, link
         If True, any bonded term connecting atoms in the specified set is
         removed.  If False, any term that does *not* connect atoms in the
         specified set is removed.
-    linkBonds: list[tuple[int, int]], optional
-        A list of bonds spanning the specified set of atoms and its complement.
-        The first index in each pair should be that of an atom in the set, and
-        the second likewise out of the set.  This is the format returned by
-        `findLinkBonds()`.
+    linkBondsData: list[dict], optional
+        The link atom data for bonds spanning the specified set of atoms and
+        its complement: a list of dictionaries, each with keys `ml` (the index
+        of the atom in the set), `mm` (the index of the atom out of the set),
+        and `d` (the distance of the link atom from the ML-side atom).  Each
+        entry corresponds to a bond of the kind returned by `findLinkBonds()`.
 
     Returns
     -------
@@ -303,7 +388,7 @@ class InterpolationHelper:
         self.cvForce.addCollectiveVariable(name, force)
         self.mmTerms.append(formatString.format(name))
 
-    def addMLPotentialTerms(self, potential: MLPotentialImpl, topology: openmm.app.Topology, atoms: list[int], forceGroup: int, **args) -> None:
+    def addMLPotentialTerms(self, potential: MLPotentialImpl, topology: openmm.app.Topology, atoms: list[int], forceGroup: int, linkBondsData: list[dict] | None = None, **args) -> None:
         """
         Helper function to add all forces created by an ML potential as ML
         terms for interpolation.
@@ -318,12 +403,16 @@ class InterpolationHelper:
             The indices of the ML region atoms in the ML/MM system.
         forceGroup: int
             The force group to pass to addForces().
+        linkBondsData: list[dict], optional
+            The link atom data for bonds spanning the ML and MM regions, in the
+            format used by `removeBonds()`.  It is passed on to addForces() for
+            potentials that support the link-atom method.
         args: dict
             Any additional arguments to pass to addForces().
         """
 
         tempSystem = openmm.System()
-        potential.addForces(topology, tempSystem, atoms, forceGroup, **args)
+        potential.addForces(topology, tempSystem, atoms, forceGroup, linkBondsData=linkBondsData, **args)
         for force in tempSystem.getForces():
             self.addMLTerm(copy.deepcopy(force))
 
@@ -340,9 +429,9 @@ class InterpolationHelper:
             terms to interpolate.
         atoms: list[int]
             The indices of the ML region atoms in the ML/MM system.
-        linkBonds: list[tuple[int, int]], optional
-            A list of bonds spanning the ML and MM regions.  See `removeBonds()`
-            for details.
+        linkBondsData: list[dict], optional
+            The link atom data for bonds spanning the ML and MM regions.  See
+            `removeBonds()` for details.
         """
 
         bondedSystem = removeBonds(mmSystem, atoms, False, linkBondsData)
