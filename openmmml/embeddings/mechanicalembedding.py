@@ -34,7 +34,6 @@ from openmmml.embeddings import utilities
 import openmm
 import openmm.app
 import copy
-import typing
 
 class MechanicalEmbeddingFactory(EmbeddingFactory):
     """This is the factory that creates MechanicalEmbedding objects."""
@@ -73,9 +72,8 @@ class MechanicalEmbedding(Embedding):
                           atoms: list[int],
                           forceGroup: int,
                           interpolate: bool,
-                          returnInfo: bool = False,
                           linkAtomPrm: list[tuple[int, int, openmm.unit.Quantity]] | None = None,
-                          **args) -> openmm.System | dict[str, typing.Any]:
+                          **args) -> openmm.System:
 
         periodic = system.usesPeriodicBoundaryConditions()
 
@@ -218,9 +216,4 @@ class MechanicalEmbedding(Embedding):
 
             potential.addForces(newTopology, newSystem, atoms, forceGroup, linkBondsData, **args)
 
-        if returnInfo:
-            # The link-atom method does not modify the Topology, so the atom
-            # mapping is the identity.
-            return dict(system=newSystem, topology=newTopology, oldToNew=list(range(newTopology.getNumAtoms())))
-        else:
-            return newSystem
+        return newSystem
