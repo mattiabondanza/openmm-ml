@@ -94,7 +94,7 @@ class MLPotentialImpl(object):
                   system: openmm.System,
                   atoms: Iterable[int] | None,
                   forceGroup: int,
-                  linkBonds: Iterable[list[int, int]], 
+                  linkBondsData: list[dict], 
                   **args):
         """Add Force objects to a System to implement the potential function.
 

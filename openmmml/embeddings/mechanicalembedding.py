@@ -74,6 +74,7 @@ class MechanicalEmbedding(Embedding):
                           forceGroup: int,
                           interpolate: bool,
                           returnInfo: bool = False,
+                          linkAtomPrm: list[tuple[int, int, openmm.unit.Quantity]] | None = None,
                           **args) -> openmm.System | dict[str, typing.Any]:
 
         periodic = system.usesPeriodicBoundaryConditions()
@@ -128,10 +129,29 @@ class MechanicalEmbedding(Embedding):
 
         linkBonds = utilities.findLinkBonds(topology, atoms)
         if len(linkBonds) > 0:
-            print(atoms)
-            print("Using link atoms!")
-            print(linkBonds)
-        newSystem = utilities.removeBonds(system, atoms, True, linkBonds=linkBonds)
+            linkBondsData = []
+            for lb in linkBonds:
+                linkBondsData += [{'ml': lb[0], 
+                                   'mm': lb[1], 
+                                   'laz': 1, # This is hardcoded, I don't think we'll need link atom that are not H
+                                   }]
+
+                if linkAtomPrm is not None:
+                    for lap in linkAtomPrm:
+                        if (lap[0] == lb[0] and lap[1] == lb[1]) or \
+                           (lap[1] == lb[0] and lap[0] == lb[1]):
+                            linkBondsData[-1]['d'] = lap[2]
+
+                if 'd' not in linkBondsData[-1]:
+                    # Use VdW table if provided
+                    linkBondsData[-1]['d'] = utilities.get_linkatom_distance(topology,
+                                                                             linkBondsData[-1]['ml'],
+                                                                             linkBondsData[-1]['mm'],
+                                                                             linkBondsData[-1]['laz'],)
+        else:
+            linkBondsData = None
+            
+        newSystem = utilities.removeBonds(system, atoms, True, linkBondsData=linkBondsData)
 
         for force in newSystem.getForces():
             if isinstance(force, openmm.NonbondedForce):
@@ -184,11 +204,9 @@ class MechanicalEmbedding(Embedding):
         #capIndices, oldToNew = utilities.addLinkAtomSites(newTopology, systemList, linkBonds, args.get("linkAtomDistances", []))
 
         if interpolate:
-            if len(linkBonds) > 0:
-                raise NotImplementedError("Still not implemented here")
             interpolator = utilities.InterpolationHelper()
             interpolator.addMLPotentialTerms(potential, newTopology, atoms, forceGroup, **args)
-            interpolator.addMMBondedTerms(system, atoms, linkBonds)
+            interpolator.addMMBondedTerms(system, atoms, linkBondsData)
             interpolator.setupNonbonded(newSystem, system)
             if excludeLongRange:
                 interpolator.addMLTerm(excludeForce, "-{}")
@@ -202,7 +220,7 @@ class MechanicalEmbedding(Embedding):
                 cvForce.addCollectiveVariable("excludeForce", excludeForce)
                 newSystem.addForce(cvForce)
 
-            potential.addForces(newTopology, newSystem, atoms, forceGroup, linkBonds, **args)
+            potential.addForces(newTopology, newSystem, atoms, forceGroup, linkBondsData, **args)
 
         if returnInfo:
             return dict(system=newSystem, topology=newTopology)
