@@ -74,6 +74,7 @@ class ASEPotentialImpl(MLPotentialImpl):
                   system: openmm.System,
                   atoms: Optional[Iterable[int]],
                   forceGroup: int,
+                  linkBondsData: list[dict] | None = None,
                   **args):
         try:
             import ase
@@ -90,6 +91,8 @@ class ASEPotentialImpl(MLPotentialImpl):
         if 'aseAtoms' in args:
             # The user provided an Atoms object.
 
+            if linkBondsData:
+                raise ValueError("The 'aseAtoms' option is not supported with the link-atom method; provide a 'calculator' instead.")
             aseAtoms = args['aseAtoms']
             if len(aseAtoms.numbers) != len(includedAtoms):
                 raise ValueError('The ASE Atoms object contains the wrong number of atoms.')
@@ -101,6 +104,10 @@ class ASEPotentialImpl(MLPotentialImpl):
             if 'calculator' not in args:
                 raise ValueError('Either an Atoms or a Calculator must be provided')
             numbers = [atom.element.atomic_number for atom in includedAtoms]
+            if linkBondsData:
+                # The link atoms are evaluated by the model in addition to the
+                # atoms in the ML subset.
+                numbers += [la['laz'] for la in linkBondsData]
             pbc = (topology.getPeriodicBoxVectors() is not None)
             aseAtoms = ase.Atoms(numbers=numbers, pbc=pbc, calculator=args['calculator'])
         if 'info' in args:
@@ -109,26 +116,22 @@ class ASEPotentialImpl(MLPotentialImpl):
 
         # Create the PythonForce and add it to the System.
 
-        compute = partial(_computeASE, atoms=aseAtoms, indices=indices)
+        compute = partial(_computeASE, atoms=aseAtoms, indices=indices, linkBondsData=linkBondsData)
         force = openmm.PythonForce(compute)
         force.setForceGroup(forceGroup)
         force.setUsesPeriodicBoundaryConditions(any(aseAtoms.get_pbc()))
         system.addForce(force)
 
 
-def _computeASE(state, atoms, indices):
+def _computeASE(state, atoms, indices, linkBondsData):
     import ase.units
-    positions = state.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
-    numAtoms = positions.shape[0]
-    if indices is not None:
-        positions = positions[indices]
+    from openmmml.embeddings import utilities
+    _positions = state.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
+    positions = utilities.system_positions_to_ml(_positions, indices, linkBondsData)
     atoms.set_positions(positions)
     if any(atoms.get_pbc()):
         atoms.set_cell(state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.angstrom))
     energy = atoms.get_potential_energy(apply_constraint=False)
     forces = atoms.get_forces(apply_constraint=False)
-    if indices is not None:
-        f = np.zeros((numAtoms, 3), dtype=np.float32)
-        f[indices] = forces
-        forces = f
+    forces = utilities.ml_forces_to_system(_positions, forces, indices, linkBondsData)
     return energy/(ase.units.kJ/ase.units.mol), forces*10/(ase.units.kJ/ase.units.mol)

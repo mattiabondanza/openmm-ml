@@ -65,6 +65,7 @@ class ANIPotentialImpl(MLPotentialImpl):
                   system: openmm.System,
                   atoms: Optional[Iterable[int]],
                   forceGroup: int,
+                  linkBondsData: list[dict] | None = None,
                   modelIndex: Optional[int] = None,
                   **args):
         # Create the TorchANI model.
@@ -92,7 +93,10 @@ class ANIPotentialImpl(MLPotentialImpl):
         includedAtoms = list(topology.atoms())
         if atoms is not None:
             includedAtoms = [includedAtoms[i] for i in atoms]
-        species = torch.tensor([[atom.element.atomic_number for atom in includedAtoms]], device=device)
+        atomicNumbers = [atom.element.atomic_number for atom in includedAtoms]
+        if linkBondsData:
+            atomicNumbers += [la['laz'] for la in linkBondsData]
+        species = torch.tensor([atomicNumbers], device=device)
         if atoms is None:
             indices = None
         else:
@@ -109,7 +113,8 @@ class ANIPotentialImpl(MLPotentialImpl):
                           model=model,
                           species=species,
                           pbc=pbc,
-                          indices=indices)
+                          indices=indices,
+                          linkBondsData=linkBondsData)
         force = openmm.PythonForce(compute)
         force.setForceGroup(forceGroup)
         force.setUsesPeriodicBoundaryConditions(periodic)
@@ -118,14 +123,13 @@ class ANIPotentialImpl(MLPotentialImpl):
     def getMLLongRange(self) -> bool | None:
         return False
 
-def _computeANI(state, model, species, pbc, indices):
+def _computeANI(state, model, species, pbc, indices, linkBondsData):
     import torch
     import numpy as np
     import torchani
-    positions = state.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
-    numAtoms = positions.shape[0]
-    if indices is not None:
-        positions = positions[indices]
+    from openmmml.embeddings import utilities
+    _positions = state.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
+    positions = utilities.system_positions_to_ml(_positions, indices, linkBondsData)
     positions = torch.tensor(positions, dtype=torch.float32, device=species.device)
     if pbc is None:
         boxvectors = None
@@ -140,8 +144,5 @@ def _computeANI(state, model, species, pbc, indices):
     energy *= torchani.units.hartree2kjoulemol(1)
     energy.backward()
     forces = (-positions.grad[0]).detach().cpu().numpy()
-    if indices is not None:
-        f = np.zeros((numAtoms, 3), dtype=np.float32)
-        f[indices] = forces
-        forces = f
+    forces = utilities.ml_forces_to_system(_positions, forces, indices, linkBondsData)
     return energy, forces

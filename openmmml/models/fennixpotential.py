@@ -89,6 +89,7 @@ class FeNNixPotentialImpl(MLPotentialImpl):
         system: openmm.System,
         atoms: Iterable[int] | None,
         forceGroup: int,
+        linkBondsData: list[dict] | None = None,
         charge: int = 0,
         precision: str = "single",
         **args
@@ -141,7 +142,10 @@ class FeNNixPotentialImpl(MLPotentialImpl):
             indices = np.array(atoms, dtype=int)
 
         # Prepare inputs to the model that remain constant from step to step.
-        species = jnp.array([atom.element.atomic_number for atom in includedAtoms], dtype=jnp.int32)
+        atomicNumbers = [atom.element.atomic_number for atom in includedAtoms]
+        if linkBondsData:
+            atomicNumbers += [la['laz'] for la in linkBondsData]
+        species = jnp.array(atomicNumbers, dtype=jnp.int32)
         inputs = dict(
             species=species,
             natoms=jnp.array([species.size], dtype=jnp.int32),
@@ -151,7 +155,7 @@ class FeNNixPotentialImpl(MLPotentialImpl):
 
         # Create the PythonForce and add it to the System.
         periodic = (topology.getPeriodicBoxVectors() is not None) or system.usesPeriodicBoundaryConditions()
-        force = openmm.PythonForce(_ComputeFeNNix(model, energyScale, forceScale, indices, inputs, periodic, useDouble))
+        force = openmm.PythonForce(_ComputeFeNNix(model, energyScale, forceScale, indices, inputs, periodic, useDouble, linkBondsData))
         force.setForceGroup(forceGroup)
         force.setUsesPeriodicBoundaryConditions(periodic)
         system.addForce(force)
@@ -164,7 +168,7 @@ class FeNNixPotentialImpl(MLPotentialImpl):
 
 
 class _ComputeFeNNix:
-    def __init__(self, model, energyScale, forceScale, indices, inputs, periodic, useDouble):
+    def __init__(self, model, energyScale, forceScale, indices, inputs, periodic, useDouble, linkBondsData=None):
         self.model = model
         self.energyScale = energyScale
         self.forceScale = forceScale
@@ -172,16 +176,16 @@ class _ComputeFeNNix:
         self.inputs = inputs
         self.periodic = periodic
         self.useDouble = useDouble
+        self.linkBondsData = linkBondsData
 
     def __call__(self, state):
         import jax
         import numpy as np
+        from openmmml.embeddings import utilities
 
         # Load coordinates and box vectors from the state.
-        positions = state.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
-        numAtoms = positions.shape[0]
-        if self.indices is not None:
-            positions = positions[self.indices]
+        _positions = state.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
+        positions = utilities.system_positions_to_ml(_positions, self.indices, self.linkBondsData)
         if self.periodic:
             cells = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.angstrom).reshape(1, 3, 3)
 
@@ -194,18 +198,14 @@ class _ComputeFeNNix:
             jaxEnergy, jaxForces = modelOutputs[:2]
             energy = jaxEnergy.item() * self.energyScale
             jaxForces *= self.forceScale
-            if self.indices is None:
-                forces = np.asarray(jaxForces)
-            else:
-                forces = np.zeros((numAtoms, 3), dtype=jaxForces.dtype)
-                forces[self.indices] = jaxForces
+            forces = utilities.ml_forces_to_system(_positions, np.asarray(jaxForces), self.indices, self.linkBondsData)
 
         return energy, forces
 
     def __getstate__(self):
-        return (self.model.to_dict(), self.energyScale, self.forceScale, self.indices, self.inputs, self.periodic, self.useDouble)
+        return (self.model.to_dict(), self.energyScale, self.forceScale, self.indices, self.inputs, self.periodic, self.useDouble, self.linkBondsData)
 
     def __setstate__(self, pickle_state):
         import fennol
-        model_dict, self.energyScale, self.forceScale, self.indices, self.inputs, self.periodic, self.useDouble = pickle_state
+        model_dict, self.energyScale, self.forceScale, self.indices, self.inputs, self.periodic, self.useDouble, self.linkBondsData = pickle_state
         self.model = fennol.FENNIX(**model_dict)

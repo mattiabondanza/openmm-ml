@@ -147,10 +147,15 @@ class DeepmdPotentialImpl(MLPotentialImpl):
                   system: openmm.System,
                   atoms: Optional[Iterable[int]],
                   forceGroup: int = 0,
+                  linkBondsData: list[dict] | None = None,
                   lambdaName: Optional[str] = None,
                   lambdaValue: Optional[float] = 1.0,
-                  **args) -> None:    
-        
+                  **args) -> None:
+        if linkBondsData is not None:
+            # The DeepmdForce of the OpenMMDeepmdPlugin is a compiled force that
+            # cannot evaluate the extra link atoms, so the link-atom method is
+            # not supported.
+            raise NotImplementedError("The DeepMD potential does not support the link-atom method.")
         if atoms is not None:
             dp_force = self.dp_model.addParticlesToDPRegion(atoms, topology)
         else:

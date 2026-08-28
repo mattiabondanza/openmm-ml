@@ -395,6 +395,9 @@ this distance is chosen as the sum of the covalent radii of the ML-side atom and
 distances, pass `linkAtomPrm=[...]` to `createMixedSystem()` with a list of tuples `(atom1, atom2, distance)` for
 each pair of atoms for which to use a custom distance.
 
+All of the built-in potentials support the link-atom method except the DeePMD one, whose `DeepmdForce` is a compiled
+force that cannot evaluate the extra link atoms; an exception will be raised if a system requires them.
+
 To avoid double-counting bonded interactions between the MM force field and ML potential, OpenMM-ML will delete:
 - All MM bonds contained completely within the ML region.
 - All MM angles and torsions contained completely within the union of the ML region with the set of atoms directly

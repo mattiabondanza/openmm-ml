@@ -135,6 +135,7 @@ class TorchMDNetPotentialImpl(MLPotentialImpl):
                   system: openmm.System,
                   atoms: Optional[Iterable[int]],
                   forceGroup: int,
+                  linkBondsData: list[dict] | None = None,
                   **args):
         # Load the TorchMDNet model.
         try:
@@ -148,7 +149,10 @@ class TorchMDNetPotentialImpl(MLPotentialImpl):
         if atoms is not None:
             includedAtoms = [includedAtoms[i] for i in atoms]
         device = self._getTorchDevice(args)
-        numbers = torch.tensor([atom.element.atomic_number for atom in includedAtoms], device=device, requires_grad=False)
+        atomicNumbers = [atom.element.atomic_number for atom in includedAtoms]
+        if linkBondsData is not None:
+            atomicNumbers += [la['laz'] for la in linkBondsData]
+        numbers = torch.tensor(atomicNumbers, device=device, requires_grad=False)
         charge = torch.tensor([args.get('charge', 0)], dtype=torch.float32, device=device, requires_grad=False)
         cutoff = 10*args.get('coulomb_cutoff', 1.2)
         if unit.is_quantity(cutoff):
@@ -186,15 +190,20 @@ class TorchMDNetPotentialImpl(MLPotentialImpl):
         ).to(device)
         for parameter in model.parameters():
             parameter.requires_grad = False
+        if atoms is None:
+            indices = None
+        else:
+            indices = np.array(atoms)
         batch = args.get('batch', None)
         if batch is None:
             batch = torch.zeros_like(numbers, requires_grad=False)
         else:
             batch = torch.tensor(batch, dtype=torch.long, device=device, requires_grad=False)
-        if atoms is None:
-            indices = None
-        else:
-            indices = np.array(atoms)
+            if linkBondsData is not None:
+                # The batch index of each link atom is the same as that of its
+                # ML-side atom.
+                laBatch = [batch[list(indices).index(la['ml'])] for la in linkBondsData]
+                batch = torch.cat([batch, torch.tensor(laBatch, dtype=torch.long, device=device, requires_grad=False)])
 
         # Create the PythonForce and add it to the System.
 
@@ -205,7 +214,8 @@ class TorchMDNetPotentialImpl(MLPotentialImpl):
                                      lengthScale=self.lengthScale,
                                      energyScale=self.energyScale,
                                      indices=indices,
-                                     periodic=periodic)
+                                     periodic=periodic,
+                                     linkBondsData=linkBondsData)
         force = openmm.PythonForce(compute)
         force.setForceGroup(forceGroup)
         force.setUsesPeriodicBoundaryConditions(periodic)
@@ -218,7 +228,7 @@ class TorchMDNetPotentialImpl(MLPotentialImpl):
         return None
 
 class _ComputeTorchMDNet(object):
-    def __init__(self, model, numbers, charge, batch, lengthScale, energyScale, indices, periodic):
+    def __init__(self, model, numbers, charge, batch, lengthScale, energyScale, indices, periodic, linkBondsData=None):
         self.model = model
         self.compiled_model = None
         self.numbers = numbers
@@ -228,15 +238,20 @@ class _ComputeTorchMDNet(object):
         self.energyScale = energyScale
         self.indices = indices
         self.periodic = periodic
+        self.linkBondsData = linkBondsData
         self.has_recompiled = False
 
     def __call__(self, state):
         import torch
-        positions = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-        numAtoms = positions.shape[0]
-        positions = torch.tensor(positions, dtype=torch.float32, device=self.numbers.device)
+        from openmmml.embeddings import utilities
+        _positions = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
         if self.indices is not None:
-            positions = positions[self.indices]
+            # The link atom distances are in angstrom, so convert the
+            # positions to angstrom for the placement and back to nm.
+            positions = utilities.system_positions_to_ml(_positions*10.0, self.indices, self.linkBondsData)/10.0
+        else:
+            positions = _positions
+        positions = torch.tensor(positions, dtype=torch.float32, device=self.numbers.device)
         positions.requires_grad_(True)
         if self.periodic:
             cell = torch.tensor(state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer), dtype=torch.float32, device=self.numbers.device)/self.lengthScale
@@ -261,8 +276,5 @@ class _ComputeTorchMDNet(object):
                 energy = self.compiled_model(z=self.numbers, pos=positions/self.lengthScale, batch=self.batch, q=self.charge, box=cell)[0]*self.energyScale
         energy.backward()
         forces = (-positions.grad).detach().cpu().numpy()
-        if self.indices is not None:
-            f = np.zeros((numAtoms, 3), dtype=np.float32)
-            f[self.indices] = forces
-            forces = f
+        forces = utilities.ml_forces_to_system(_positions, forces, self.indices, self.linkBondsData)
         return energy, forces

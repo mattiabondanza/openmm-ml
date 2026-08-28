@@ -122,6 +122,7 @@ class NequIPPotentialImpl(MLPotentialImpl):
         system: openmm.System,
         atoms: Optional[Iterable[int]],
         forceGroup: int,
+        linkBondsData: list[dict] | None = None,
         precision: Optional[str] = None,
         atomTypes: Optional[List[int]] = None,
         **args,
@@ -191,14 +192,18 @@ class NequIPPotentialImpl(MLPotentialImpl):
             )
             model.to(dtype)
 
-        # Get the atom types
+        # Get the atom types.  The types of the link atoms are always inferred
+        # from the model's element names, since a user-provided atomTypes list
+        # only covers the atoms in the ML subset.
+        typeNames = model.metadata[graph_model.TYPE_NAMES_KEY].split()
+        typeNameToTypeIndex = {name: i for i, name in enumerate(typeNames)}
         if atomTypes is None:
-            typeNames = model.metadata[graph_model.TYPE_NAMES_KEY].split()
-            typeNameToTypeIndex = {typeNames: i for i, typeNames in enumerate(typeNames)}
             atomTypes = [typeNameToTypeIndex[atom.element.symbol] for atom in includedAtoms]
         else:
             if len(atomTypes) != len(includedAtoms):
                 raise ValueError("The length of atomTypes must be equal to the number of ML atoms in the system.")
+        if linkBondsData is not None:
+            atomTypes += [typeNameToTypeIndex[openmm.app.Element.getByAtomicNumber(la['laz']).symbol] for la in linkBondsData]
         if atoms is None:
             indices = None
         else:
@@ -218,20 +223,20 @@ class NequIPPotentialImpl(MLPotentialImpl):
                           energyScale=self.energyScale,
                           indices=indices,
                           periodic=periodic,
-                          pbc=pbc)
+                          pbc=pbc,
+                          linkBondsData=linkBondsData)
         force = openmm.PythonForce(compute)
         force.setForceGroup(forceGroup)
         force.setUsesPeriodicBoundaryConditions(periodic)
         system.addForce(force)
 
-def _computeNequIP(state, model, atomTypes, cutoff, lengthScale, energyScale, indices, periodic, pbc):
+def _computeNequIP(state, model, atomTypes, cutoff, lengthScale, energyScale, indices, periodic, pbc, linkBondsData):
     import torch
     from nequip.data._nl import compute_neighborlist_
-    positions = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)/lengthScale
-    numAtoms = positions.shape[0]
-    positions = torch.tensor(positions, dtype=torch.float64, device=atomTypes.device)
-    if indices is not None:
-        positions = positions[indices]
+    from openmmml.embeddings import utilities
+    _positions = state.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
+    positions = utilities.system_positions_to_ml(_positions, indices, linkBondsData)
+    positions = torch.tensor(positions, dtype=torch.float64, device=atomTypes.device) * (0.1/lengthScale)
     inputDict = {
         "pos": positions,
         "atom_types": atomTypes,
@@ -243,8 +248,5 @@ def _computeNequIP(state, model, atomTypes, cutoff, lengthScale, energyScale, in
     out = model(inputDict)
     energy = out["total_energy"] * energyScale
     forces = out["forces"].detach().cpu().numpy()
-    if indices is not None:
-        f = np.zeros((numAtoms, 3), dtype=np.float64)
-        f[indices] = forces
-        forces = f
+    forces = utilities.ml_forces_to_system(_positions, forces, indices, linkBondsData)
     return energy, forces*energyScale/lengthScale

@@ -214,6 +214,6 @@ class MechanicalEmbedding(Embedding):
                 cvForce.addCollectiveVariable("excludeForce", excludeForce)
                 newSystem.addForce(cvForce)
 
-            potential.addForces(newTopology, newSystem, atoms, forceGroup, linkBondsData, **args)
+            potential.addForces(newTopology, newSystem, atoms, forceGroup, linkBondsData=linkBondsData, **args)
 
         return newSystem

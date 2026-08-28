@@ -70,6 +70,7 @@ class OrbPotentialImpl(MLPotentialImpl):
         system: openmm.System,
         atoms: Iterable[int] | None,
         forceGroup: int,
+        linkBondsData: list[dict] | None = None,
         charge: int = 0,
         multiplicity: int = 1,
         **args
@@ -102,12 +103,14 @@ class OrbPotentialImpl(MLPotentialImpl):
 
         # Set up the ASE Atoms object that will be fed to the model.
         numbers = [atom.element.atomic_number for atom in includedAtoms]
+        if linkBondsData:
+            numbers += [la['laz'] for la in linkBondsData]
         periodic = (topology.getPeriodicBoxVectors() is not None) or system.usesPeriodicBoundaryConditions()
         aseAtoms = ase.Atoms(numbers=numbers, pbc=periodic)
         aseAtoms.info['charge'] = charge
         aseAtoms.info['spin'] = multiplicity
 
-        compute = partial(_computeOrb, atoms=aseAtoms, indices=indices, periodic=periodic, device=device, model=model, adapter=adapter, conservative=conservative)
+        compute = partial(_computeOrb, atoms=aseAtoms, indices=indices, periodic=periodic, device=device, model=model, adapter=adapter, conservative=conservative, linkBondsData=linkBondsData)
         force = openmm.PythonForce(compute)
         force.setForceGroup(forceGroup)
         force.setUsesPeriodicBoundaryConditions(any(aseAtoms.get_pbc()))
@@ -116,14 +119,13 @@ class OrbPotentialImpl(MLPotentialImpl):
     def getMLLongRange(self) -> bool | None:
         return False
 
-def _computeOrb(state, atoms, indices, periodic, device, model, adapter, conservative):
+def _computeOrb(state, atoms, indices, periodic, device, model, adapter, conservative, linkBondsData):
     import ase.units
     import numpy as np
+    from openmmml.embeddings import utilities
 
-    positions = state.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
-    numAtoms = positions.shape[0]
-    if indices is not None:
-        positions = positions[indices]
+    _positions = state.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
+    positions = utilities.system_positions_to_ml(_positions, indices, linkBondsData)
     atoms.set_positions(positions)
     if periodic:
         atoms.set_cell(state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.angstrom))
@@ -131,8 +133,5 @@ def _computeOrb(state, atoms, indices, periodic, device, model, adapter, conserv
     result = model.predict(adapter.from_ase_atoms(atoms, device=device))
     energy = result["energy"].item()
     forces = result[model.grad_forces_name if conservative else "forces"].numpy(force=True)
-    if indices is not None:
-        f = np.zeros((numAtoms, 3), dtype=forces.dtype)
-        f[indices] = forces
-        forces = f
+    forces = utilities.ml_forces_to_system(_positions, forces, indices, linkBondsData)
     return energy / (ase.units.kJ / ase.units.mol), forces / (ase.units.kJ / (ase.units.mol * ase.units.nm))

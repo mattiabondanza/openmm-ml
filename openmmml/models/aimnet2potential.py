@@ -98,6 +98,7 @@ class AIMNet2PotentialImpl(MLPotentialImpl):
                   system: openmm.System,
                   atoms: Optional[Iterable[int]],
                   forceGroup: int,
+                  linkBondsData: list[dict] | None = None,
                   modelIndex: int = 0,
                   **args):
         # Load the AIMNet2 model.
@@ -139,14 +140,17 @@ class AIMNet2PotentialImpl(MLPotentialImpl):
         else:
             includedAtoms = [includedAtoms[i] for i in atoms]
             indices = np.array(atoms)
-        numbers = torch.tensor([[atom.element.atomic_number for atom in includedAtoms]], device=device)
+        atomicNumbers = [atom.element.atomic_number for atom in includedAtoms]
+        if linkBondsData:
+            atomicNumbers += [la['laz'] for la in linkBondsData]
+        numbers = torch.tensor([atomicNumbers], device=device)
         charge = torch.tensor([args.get('charge', 0)], dtype=torch.float32, device=device)
         multiplicity = torch.tensor([args.get('multiplicity', 1)], dtype=torch.float32, device=device)
         periodic = topology.getPeriodicBoxVectors() is not None
 
         # Create the PythonForce and add it to the System.
 
-        compute = partial(_computeAIMNet2, model=model, numbers=numbers, charge=charge, multiplicity=multiplicity, indices=indices, periodic=periodic)
+        compute = partial(_computeAIMNet2, model=model, numbers=numbers, charge=charge, multiplicity=multiplicity, indices=indices, periodic=periodic, linkBondsData=linkBondsData)
         force = openmm.PythonForce(compute)
         force.setForceGroup(forceGroup)
         force.setUsesPeriodicBoundaryConditions(periodic)
@@ -163,12 +167,12 @@ class AIMNet2PotentialImpl(MLPotentialImpl):
         # supported model has different behavior, this must be updated.
         return False
 
-def _computeAIMNet2(state, model, numbers, charge, multiplicity, indices, periodic):
+def _computeAIMNet2(state, model, numbers, charge, multiplicity, indices, periodic, linkBondsData):
     import torch
-    positions = torch.tensor(state.getPositions(asNumpy=True).value_in_unit(unit.angstrom), dtype=torch.float32, device=numbers.device)
-    numAtoms = positions.shape[0]
-    if indices is not None:
-        positions = positions[indices]
+    from openmmml.embeddings import utilities
+    _positions = state.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
+    positions = utilities.system_positions_to_ml(_positions, indices, linkBondsData)
+    positions = torch.tensor(positions, dtype=torch.float32, device=numbers.device)
     args = {'coord': positions.unsqueeze(0),
             'numbers': numbers,
             'charge': charge,
@@ -180,8 +184,5 @@ def _computeAIMNet2(state, model, numbers, charge, multiplicity, indices, period
     energyScale = (unit.ev/unit.item).conversion_factor_to(unit.kilojoules_per_mole)
     energy = float(energyScale*result["energy"].sum().detach())
     forces = (10.0*energyScale*result["forces"]).detach().cpu().numpy()[0]
-    if indices is not None:
-        f = np.zeros((numAtoms, 3), dtype=np.float32)
-        f[indices] = forces
-        forces = f
+    forces = utilities.ml_forces_to_system(_positions, forces, indices, linkBondsData)
     return energy, forces

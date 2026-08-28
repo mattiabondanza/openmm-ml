@@ -1,3 +1,4 @@
+import copy
 import numpy as np
 import openmm
 import openmm.app
@@ -5,6 +6,7 @@ import os
 import pytest
 
 from openmmml import MLPotential
+from openmmml.embeddings import utilities
 
 ase = pytest.importorskip("ase", reason="ase is not installed")
 mace = pytest.importorskip("mace", reason="mace is not installed")
@@ -211,11 +213,82 @@ class TestMechanicalEmbedding:
             if atom_1 in subset_set and atom_2 in subset_set:
                 assert ((atom_1, atom_2) in mixed_constraints or (atom_2, atom_1) in mixed_constraints) != remove
 
-    @pytest.mark.parametrize("override_distance", (False, True))
-    def testLinkAtomTerms(self, platform_int, override_distance):
+    def testLinkAtomForceProjection(self, platform_int):
         """
-        Test for presence of the appropriate terms and positions of the virtual
-        sites in the link-atom method.
+        The position of each link atom is a function of the positions of the
+        two atoms of the bond spanning the ML and MM regions.  The force
+        projection performed by `ml_forces_to_system()` must therefore equal
+        the exact gradient of the energy of the link atoms with respect to the
+        positions of all atoms, and `system_positions_to_ml()` must place each
+        link atom at the position implied by the constraint.
+        """
+
+        def check(positions, indices, linkBondsData):
+            # An arbitrary nonlinear energy that depends on the positions of
+            # the link atoms only (each through the two atoms of its own bond).
+            coeffs = [np.random.default_rng(i).normal(size=3) for i in range(len(linkBondsData))]
+
+            def la_position(ps, la):
+                vers = ps[la['mm']] - ps[la['ml']]
+                vers /= np.linalg.norm(vers)
+                return ps[la['ml']] + vers*la['d'].value_in_unit(openmm.unit.angstrom)
+
+            def energy(ps):
+                total = 0.0
+                for i, la in enumerate(linkBondsData):
+                    r = la_position(ps, la)
+                    c = coeffs[i]
+                    total += np.sum((r - c)**4) + np.sum(r**2) + 0.5*np.dot(r, [1, 2, 3])*np.sum(r)
+                return total
+
+            def la_forces(ps):
+                forces = []
+                for i, la in enumerate(linkBondsData):
+                    r = la_position(ps, la)
+                    c = coeffs[i]
+                    forces.append(-(4*(r - c)**3 + 2*r + 0.5*np.array([1, 2, 3])*np.sum(r) + 0.5*np.dot(r, [1, 2, 3])))
+                return forces
+
+            nml = len(indices)
+            ml_forces = np.vstack([np.zeros((nml, 3))] + [f.reshape(1, 3) for f in la_forces(positions)])
+            forces = utilities.ml_forces_to_system(positions, ml_forces, indices, linkBondsData)
+
+            # Check the projected forces against finite differences of the
+            # energy for every atom.
+            eps = 1e-7
+            for atom in range(len(positions)):
+                for i in range(3):
+                    p = positions.copy()
+                    p[atom, i] += eps
+                    expected = -(energy(p) - energy(positions))/eps
+                    assert np.isclose(forces[atom, i], expected, atol=1e-5), \
+                        f"atom {atom}, component {i}: {forces[atom, i]} != {expected}"
+
+            # Check the extracted positions: the ML subset positions followed
+            # by the constrained link atom positions.
+            expected_positions = np.vstack([positions[indices]] + [la_position(positions, la).reshape(1, 3) for la in linkBondsData])
+            assert np.allclose(utilities.system_positions_to_ml(positions, indices, linkBondsData), expected_positions)
+
+        rng = np.random.default_rng(0)
+
+        # A single link bond between atom 0 (ML) and atom 1 (MM).
+        r_ml = rng.normal(size=3)
+        r_mm = r_ml + rng.normal(size=3) + 2.0
+        check(np.stack([r_ml, r_mm]), [0], [{'ml': 0, 'mm': 1, 'laz': 1, 'd': 1.07*openmm.unit.angstrom}])
+
+        # Multiple link bonds, with the ML and MM atoms interleaved.
+        positions = rng.normal(size=(6, 3)) + 3.0
+        check(positions, [0, 2, 4], [
+            {'ml': 0, 'mm': 1, 'laz': 1, 'd': 1.09*openmm.unit.angstrom},
+            {'ml': 2, 'mm': 3, 'laz': 1, 'd': 1.07*openmm.unit.angstrom},
+        ])
+
+    @pytest.mark.parametrize("model_name", ("mace-off23-small", "ase"))
+    @pytest.mark.parametrize("override_distance", (False, True))
+    def testLinkAtomTerms(self, platform_int, model_name, override_distance):
+        """
+        Test for presence of the appropriate terms in the link-atom method, and
+        that the ML potential sees the ML region capped by link atoms.
         """
 
         pdb = openmm.app.PDBFile(os.path.join(test_data_dir, "ethanol", "ethanol.pdb"))
@@ -227,21 +300,28 @@ class TestMechanicalEmbedding:
                   H5   H7
         """
 
-        # Expected distances are in nanometers.
-        expected_cc_distance = 0.1525970013793 # From force field.
-        if override_distance:
-            expected_ch_distance = 0.12
-        else:
-            expected_ch_distance = 0.107 # From default covalent radii.
-
         mm_force_field = openmm.app.ForceField(os.path.join(test_data_dir, "ethanol", "ethanol.xml"))
-        ml_potential = MLPotential("mace-off23-small")
+        if model_name == "ase":
+            # Use the ASE potential with a MACE calculator to test a
+            # non-MACE model.
+            from mace.calculators.foundations_models import mace_off
+            ml_potential = MLPotential("ase")
+            potential_args = dict(calculator=mace_off("small", default_dtype="float32"))
+        else:
+            ml_potential = MLPotential(model_name)
+            potential_args = {}
+        subset = [0, 1, 3, 4, 5]
 
         mm_system = mm_force_field.createSystem(pdb.topology)
         args = {}
         if override_distance:
-            args["linkAtomDistances"] = [(1, 2, 0.12)]
-        mixed_system = ml_potential.createMixedSystem(pdb.topology, mm_system, [0, 1, 3, 4, 5], interpolate=False, **args)
+            args["linkAtomPrm"] = [(1, 2, 0.12*openmm.unit.nanometer)]
+        mixed_system = ml_potential.createMixedSystem(pdb.topology, mm_system, subset, interpolate=False, **potential_args, **args)
+
+        # The link atoms are not real particles: the particle count is
+        # unchanged and no virtual sites are present.
+        assert mixed_system.getNumParticles() == mm_system.getNumParticles() == pdb.topology.getNumAtoms()
+        assert not any(mixed_system.isVirtualSite(i) for i in range(mixed_system.getNumParticles()))
 
         def get_terms(system):
             bonds = set()
@@ -278,30 +358,57 @@ class TestMechanicalEmbedding:
         assert mm_angles - mixed_angles == {(0, 1, 2), (0, 1, 4), (0, 1, 5), (1, 0, 3), (2, 1, 4), (2, 1, 5), (4, 1, 5)}
         assert mm_torsions - mixed_torsions == {(2, 1, 0, 3), (3, 0, 1, 4), (3, 0, 1, 5)}
 
+        # The ML potential must see the ML region capped by a link atom on the
+        # C1-C2 bond: its energy must equal that of an equivalent system in
+        # which the capping hydrogen is a real atom.
+        distance = 0.12*openmm.unit.nanometer if override_distance else utilities.get_linkatom_distance(pdb.topology, 1, 2, 1)
+
+        pos_np = np.array([np.asarray(p) for p in pdb.positions.value_in_unit(openmm.unit.nanometer)])
+        delta = pos_np[2] - pos_np[1]
+        capping_position = pos_np[1] + delta/np.linalg.norm(delta)*distance.value_in_unit(openmm.unit.nanometer)
+
+        # Reference system: the ML region capped by an explicit hydrogen,
+        # modeled entirely by the ML potential.
+        modeller = openmm.app.Modeller(pdb.topology, pdb.positions)
+        modeller.delete([atom for atom in pdb.topology.atoms() if atom.index not in subset])
+        ref_topology = modeller.getTopology()
+        ref_topology.addAtom("LA", openmm.app.element.hydrogen, list(ref_topology.residues())[0])
+        ref_atoms = list(ref_topology.atoms())
+        ref_topology.addBond(ref_atoms[1], ref_atoms[-1])
+        ref_system = ml_potential.createSystem(ref_topology, **potential_args)
+
+        # The MM part of the mixed system: the conventional terms with the
+        # ML-internal bonded terms removed and the ML-ML nonbonded terms
+        # zeroed, as done by the mechanical embedding.
+        linkBondsData = [{'ml': 1, 'mm': 2, 'laz': 1, 'd': distance}]
+        mm_part = utilities.removeBonds(mm_system, subset, True, linkBondsData=linkBondsData)
+        for force in mm_part.getForces():
+            if isinstance(force, openmm.NonbondedForce):
+                for i1 in range(len(subset)):
+                    for i2 in range(i1):
+                        force.addException(subset[i1], subset[i2], 0, 1, 0, True)
+
         platform = openmm.Platform.getPlatform(platform_int)
-        context = openmm.Context(mixed_system, openmm.LangevinIntegrator(300, 1, 0.001), platform)
-        context.setPositions(pdb.positions + [openmm.Vec3(0, 0, 0)] * openmm.unit.nanometer)
-        context.computeVirtualSites()
+        mixed_context = openmm.Context(mixed_system, openmm.VerletIntegrator(0.001), platform)
+        mixed_context.setPositions(pdb.positions)
+        ref_context = openmm.Context(ref_system, openmm.VerletIntegrator(0.001), platform)
+        ref_context.setPositions([openmm.Vec3(*p) for p in np.vstack([pos_np[subset], capping_position])])
+        mm_context = openmm.Context(mm_part, openmm.VerletIntegrator(0.001), platform)
+        mm_context.setPositions(pdb.positions)
 
-        def check_positions():
-            positions = context.getState(positions=True).getPositions(asNumpy=True) / openmm.unit.nanometer
-            delta_c1_c2 = positions[2] - positions[1]
-            delta_c1_vs = positions[9] - positions[1]
-            dist_c1_c2 = np.linalg.norm(delta_c1_c2)
-            dist_c1_vs = np.linalg.norm(delta_c1_vs)
+        mixed_energy = mixed_context.getState(energy=True).getPotentialEnergy().value_in_unit(openmm.unit.kilojoule_per_mole)
+        ref_energy = ref_context.getState(energy=True).getPotentialEnergy().value_in_unit(openmm.unit.kilojoule_per_mole)
+        mm_part_energy = mm_context.getState(energy=True).getPotentialEnergy().value_in_unit(openmm.unit.kilojoule_per_mole)
 
-            # Virtual site should be the appropriate distance from C1.
-            assert np.isclose(dist_c1_vs, expected_ch_distance)
-            # Virtual site should be in line with C1-C2.
-            assert np.isclose(delta_c1_c2 @ delta_c1_vs, dist_c1_c2 * dist_c1_vs)
-            # C1-C2 distance should be appropriate.
-            assert dist_c1_c2 < 1.5 * expected_cc_distance
+        assert np.isclose(mixed_energy, ref_energy + mm_part_energy, rtol=0, atol=atol)
 
-        # Check positions, run some dynamics, and check again.
-        check_positions()
-        openmm.LocalEnergyMinimizer.minimize(context)
-        context.getIntegrator().step(1000)
-        check_positions()
+        # Run some dynamics to make sure the link-atom terms behave during
+        # integration.
+        integrator = openmm.LangevinIntegrator(300, 1, 0.001)
+        dynamics_context = openmm.Context(mixed_system, integrator, platform)
+        dynamics_context.setPositions(pdb.positions)
+        openmm.LocalEnergyMinimizer.minimize(dynamics_context)
+        integrator.step(100)
 
     def testLinkAtomInterpolation(self, platform_int):
         """
@@ -323,9 +430,8 @@ class TestMechanicalEmbedding:
         interpolate_context = openmm.Context(interpolate_system, openmm.VerletIntegrator(0.001), platform)
 
         mm_context.setPositions(pdb.positions)
-        for context in (mixed_context, interpolate_context):
-            context.setPositions(pdb.positions + [openmm.Vec3(0, 0, 0)] * openmm.unit.nanometer)
-            context.computeVirtualSites()
+        mixed_context.setPositions(pdb.positions)
+        interpolate_context.setPositions(pdb.positions)
 
         mm_energy = mm_context.getState(energy=True).getPotentialEnergy().value_in_unit(openmm.unit.kilojoule_per_mole)
         mixed_energy = mixed_context.getState(energy=True).getPotentialEnergy().value_in_unit(openmm.unit.kilojoule_per_mole)
@@ -335,9 +441,10 @@ class TestMechanicalEmbedding:
             interpolate_energy = interpolate_context.getState(energy=True).getPotentialEnergy().value_in_unit(openmm.unit.kilojoule_per_mole)
             assert np.isclose(interpolate_energy, mixed_energy * lambda_value + mm_energy * (1 - lambda_value), rtol=0, atol=atol)
 
-    def testLinkAtomInfo(self, platform_int):
+    def testCreateMixedSystem(self, platform_int):
         """
-        Ensure the returnInfo keyword works with the link-atom method.
+        Ensure createMixedSystem() always returns a plain System and does not
+        modify the input Topology or System.
         """
 
         pdb = openmm.app.PDBFile(os.path.join(test_data_dir, "ethanol", "ethanol.pdb"))
@@ -345,19 +452,21 @@ class TestMechanicalEmbedding:
         ml_potential = MLPotential("mace-off23-small")
         mm_system = mm_force_field.createSystem(pdb.topology)
 
-        original_count = mm_system.getNumParticles()
-        mixed_system = ml_potential.createMixedSystem(pdb.topology, mm_system, [0, 1, 3, 4, 5], returnInfo=False)
-        mixed_info = ml_potential.createMixedSystem(pdb.topology, mm_system, [0, 1, 3, 4, 5], returnInfo=True)
+        def bond_count(system):
+            bond_force, = (force for force in system.getForces() if isinstance(force, openmm.HarmonicBondForce))
+            return bond_force.getNumBonds()
 
+        original_topology = copy.deepcopy(pdb.topology)
+        original_system = openmm.XmlSerializer.deserialize(openmm.XmlSerializer.serialize(mm_system))
+        mixed_system = ml_potential.createMixedSystem(pdb.topology, mm_system, [0, 1, 3, 4, 5])
+
+        # A plain System is returned, with the same number of particles as the
+        # input (the link atoms are not real particles).
         assert isinstance(mixed_system, openmm.System)
-        assert isinstance(mixed_info["system"], openmm.System)
-        assert isinstance(mixed_info["topology"], openmm.app.Topology)
+        assert mixed_system.getNumParticles() == mm_system.getNumParticles() == pdb.topology.getNumAtoms()
 
         # Make sure the inputs were not modified.
-        assert mm_system.getNumParticles() == pdb.topology.getNumAtoms() == original_count
-        # Make sure the outputs have been modified and match.
-        assert mixed_system.getNumParticles() == mixed_info["system"].getNumParticles() == mixed_info["topology"].getNumAtoms() > original_count
-        # Make sure the virtual sites were appended to the end.
-        assert mixed_info["oldToNew"] == list(range(original_count))
-        for i in range(mixed_system.getNumParticles()):
-            assert mixed_system.isVirtualSite(i) == (i >= original_count)
+        assert pdb.topology.getNumAtoms() == original_topology.getNumAtoms()
+        assert mm_system.getNumParticles() == original_system.getNumParticles()
+        assert mm_system.getNumConstraints() == original_system.getNumConstraints()
+        assert bond_count(mm_system) == bond_count(original_system)

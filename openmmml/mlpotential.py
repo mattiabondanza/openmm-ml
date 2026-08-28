@@ -114,9 +114,15 @@ class MLPotentialImpl(object):
         linkBondsData: list[dict], optional
             link atom data for bonds spanning the ML and MM regions of a mixed
             system, in the format used by the mechanical embedding's link-atom
-            method (see `openmmml.embeddings.utilities`).  Only potentials that
-            support the link-atom method need to handle this argument; others
-            may ignore it.
+            method (see `openmmml.embeddings.utilities`).  Implementations that
+            support the link-atom method should use it to add the link atoms to
+            the set of atoms evaluated by the model, placing them at the
+            specified distance from the ML-side atom of each bond (see
+            `openmmml.embeddings.utilities.system_positions_to_ml()`) and
+            projecting the forces on them back onto the two atoms of the bond
+            (see `openmmml.embeddings.utilities.ml_forces_to_system()`).
+            Implementations that do not support the link-atom method should
+            raise an exception if linkBondsData is not None.
         args:
             any additional keyword arguments that were provided to createSystem()
             are passed to this method.  This allows subclasses to customize their
